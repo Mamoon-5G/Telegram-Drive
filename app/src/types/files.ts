@@ -62,5 +62,5 @@ export interface BandwidthStats {
   up_bytes: number;
   down_bytes: number;
   limit_bytes: number;
-  period: 'weekly';
+  period: 'daily' | 'weekly';
 }

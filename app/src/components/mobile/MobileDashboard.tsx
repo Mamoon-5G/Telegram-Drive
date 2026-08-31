@@ -1167,7 +1167,7 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
               {bandwidth && (
                 <div className="py-2">
                   <div className="flex items-center justify-between gap-3">
-                    <div><p className="text-xs font-medium">250 GB weekly limit</p><p className="text-[10px] text-telegram-subtext">Uploads and downloads reset Monday</p></div>
+                    <div><p className="text-xs font-medium">1000 GiB daily upload limit</p><p className="text-[10px] text-telegram-subtext">Upload quota resets daily at midnight</p></div>
                     <p className="text-[11px] font-mono font-semibold text-telegram-text">
                       <span className="text-emerald-400">↑ {formatBytes(bandwidth.up_bytes)}</span>
                       {' · '}

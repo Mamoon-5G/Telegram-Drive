@@ -1740,7 +1740,7 @@ async fn cmd_upload_file_inner(
     // cannot strand a bandwidth reservation.
     let video_metadata =
         prepare_video_upload_metadata(&path, &file_name, video_upload_mode).await?;
-    bw_state.try_reserve_up(size)?;
+    let mut bandwidth_reservation = BandwidthReservation::upload(bw_state.inner().clone(), size)?;
 
     let tid = transfer_id.unwrap_or_default();
 
@@ -1748,13 +1748,9 @@ async fn cmd_upload_file_inner(
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
         log::info!("[MOCK] Uploaded file {} to {:?}", path, folder_id);
-        bw_state.release_up(size);
         return Ok("Mock upload successful".to_string());
     }
-    let client = client_opt.ok_or_else(|| {
-        bw_state.release_up(size);
-        "Client not connected".to_string()
-    })?;
+    let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
 
     // Emit start progress
     if !tid.is_empty() {
@@ -1771,10 +1767,7 @@ async fn cmd_upload_file_inner(
     }
 
     // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) =
-        ProgressReader::new(&path).await.inspect_err(|_| {
-            bw_state.release_up(size);
-        })?;
+    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
     // Spawn a progress reporter task that emits events every 250ms
     let cancelled = state.cancelled_transfers.clone();
     let progress_tid = tid.clone();
@@ -1857,7 +1850,6 @@ async fn cmd_upload_file_inner(
                     get_upload_cancellations().lock().unwrap().remove(&tid);
                 }
                 res.map_err(|e| {
-                    bw_state.release_up(size);
                     format!("Task join error: {}", e)
                 })?
             }
@@ -1866,7 +1858,6 @@ async fn cmd_upload_file_inner(
                 upload_task.abort();
                 state.cancelled_transfers.write().await.remove(&tid);
                 if let Some(t) = progress_task { t.abort(); }
-                bw_state.release_up(size);
                 return Err("Transfer cancelled".to_string());
             }
         }
@@ -1903,6 +1894,7 @@ async fn cmd_upload_file_inner(
     for attempt in 0..=max_retries {
         match client.send_message(&peer, message.clone()).await {
             Ok(sent) => {
+                bandwidth_reservation.commit();
                 if !tid.is_empty() {
                     let _ = app_handle.emit(
                         "upload-progress",
@@ -5012,10 +5004,6 @@ pub async fn cmd_upload_from_url(
             return Err("Insufficient disk space in temp directory.".to_string());
         }
         bw_state.try_reserve_down(sz)?;
-        if let Err(e) = bw_state.try_reserve_up(sz) {
-            bw_state.release_down(sz);
-            return Err(e);
-        }
     }
 
     let display_total = known_size.unwrap_or(0); // 0 = unknown size to frontend
@@ -5069,7 +5057,6 @@ pub async fn cmd_upload_from_url(
             Err(e) => {
                 if let Some(sz) = known_size {
                     bw_state.release_down(sz);
-                    bw_state.release_up(sz);
                 }
                 return Err(e);
             }
@@ -5091,7 +5078,6 @@ pub async fn cmd_upload_from_url(
                 Err(e) => {
                     if let Some(sz) = known_size {
                         bw_state.release_down(sz);
-                        bw_state.release_up(sz);
                     }
                     return Err(e.to_string());
                 }
@@ -5103,7 +5089,6 @@ pub async fn cmd_upload_from_url(
                 Err(e) => {
                     if let Some(sz) = known_size {
                         bw_state.release_down(sz);
-                        bw_state.release_up(sz);
                     }
                     return Err(e.to_string());
                 }
@@ -5119,7 +5104,6 @@ pub async fn cmd_upload_from_url(
             Err(e) => {
                 if let Some(sz) = known_size {
                     bw_state.release_down(sz);
-                    bw_state.release_up(sz);
                 }
                 return Err(e.to_string());
             }
@@ -5130,7 +5114,6 @@ pub async fn cmd_upload_from_url(
             Err(e) => {
                 if let Some(sz) = known_size {
                     bw_state.release_down(sz);
-                    bw_state.release_up(sz);
                 }
                 return Err(e.to_string());
             }
@@ -5148,7 +5131,6 @@ pub async fn cmd_upload_from_url(
             let _ = tokio::fs::remove_file(&temp_file_path).await;
             if let Some(size) = known_size {
                 bw_state.release_down(size);
-                bw_state.release_up(size);
             }
             return Err(format!(
                 "Failed to protect remote-upload temporary file: {}",
@@ -5174,7 +5156,6 @@ pub async fn cmd_upload_from_url(
                 let _ = tokio::fs::remove_file(&temp_file_path).await;
                 if let Some(sz) = known_size {
                     bw_state.release_down(sz);
-                    bw_state.release_up(sz);
                 }
                 return Err("Transfer cancelled".to_string());
             }
@@ -5184,7 +5165,6 @@ pub async fn cmd_upload_from_url(
                 Err(e) => {
                     if let Some(sz) = known_size {
                         bw_state.release_down(sz);
-                        bw_state.release_up(sz);
                     }
                     return Err(e.to_string());
                 }
@@ -5193,7 +5173,6 @@ pub async fn cmd_upload_from_url(
             if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
                 if let Some(sz) = known_size {
                     bw_state.release_down(sz);
-                    bw_state.release_up(sz);
                 }
                 return Err(e.to_string());
             }
@@ -5258,14 +5237,12 @@ pub async fn cmd_upload_from_url(
         if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
             if let Some(sz) = known_size {
                 bw_state.release_down(sz);
-                bw_state.release_up(sz);
             }
             return Err(e.to_string());
         }
         if let Err(e) = file.sync_all().await {
             if let Some(sz) = known_size {
                 bw_state.release_down(sz);
-                bw_state.release_up(sz);
             }
             return Err(e.to_string());
         }
@@ -5274,8 +5251,6 @@ pub async fn cmd_upload_from_url(
     drop(file);
     if let Some(sz) = known_size {
         bw_state.release_down(sz);
-        // Release the upfront upload reservation — we'll re-reserve based on actual size below
-        bw_state.release_up(sz);
     }
 
     // Determine actual file size from disk (authoritative, works even without Content-Length)
@@ -5374,9 +5349,9 @@ pub async fn cmd_upload_from_url(
             .ok()
             .and_then(|u| {
                 u.path_segments()
-                    .and_then(|mut segs| segs.next_back())
-                    .filter(|s| !s.is_empty())
+                    .and_then(|mut s| s.next_back())
                     .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
             })
             .unwrap_or_else(|| "remote_file".to_string())
     });
@@ -5394,17 +5369,20 @@ pub async fn cmd_upload_from_url(
         }
     };
 
-    // Reserve upload bandwidth based on the real file size (handles both known and unknown upfront)
-    if let Err(e) = bw_state.try_reserve_up(actual_size) {
-        let _ = tokio::fs::remove_file(&temp_file_path).await;
-        return Err(e);
-    }
+    // RAII upload reservation prevents quota leaks on every error and cancellation path.
+    let mut bandwidth_reservation =
+        match BandwidthReservation::upload(bw_state.inner().clone(), actual_size) {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                return Err(e);
+            }
+        };
 
     let client_opt = { state.client.lock().await.clone() };
     let client = match client_opt {
         Some(c) => c,
         None => {
-            bw_state.release_up(actual_size);
             let _ = tokio::fs::remove_file(&temp_file_path).await;
             return Err("Client not connected".to_string());
         }
@@ -5425,7 +5403,6 @@ pub async fn cmd_upload_from_url(
     let (mut reader, file_size, bytes_counter) = match ProgressReader::new(&temp_file_str).await {
         Ok(res) => res,
         Err(e) => {
-            bw_state.release_up(actual_size);
             let _ = tokio::fs::remove_file(&temp_file_path).await;
             return Err(e);
         }
@@ -5486,7 +5463,6 @@ pub async fn cmd_upload_from_url(
     {
         state.cancelled_transfers.write().await.remove(&transfer_id);
         progress_task.abort();
-        bw_state.release_up(actual_size);
         let _ = tokio::fs::remove_file(&temp_file_path).await;
         return Err("Transfer cancelled".to_string());
     }
@@ -5511,13 +5487,11 @@ pub async fn cmd_upload_from_url(
                 match res {
                     Ok(Ok(file)) => file,
                     Ok(Err(e)) => {
-                        bw_state.release_up(actual_size);
                         progress_task.abort();
                         let _ = tokio::fs::remove_file(&temp_file_path).await;
                         return Err(map_error(e));
                     }
                     Err(e) => {
-                        bw_state.release_up(actual_size);
                         progress_task.abort();
                         let _ = tokio::fs::remove_file(&temp_file_path).await;
                         return Err(format!("Task join error: {}", e));
@@ -5529,7 +5503,6 @@ pub async fn cmd_upload_from_url(
                 upload_task.abort();
                 state.cancelled_transfers.write().await.remove(&transfer_id);
                 progress_task.abort();
-                bw_state.release_up(actual_size);
                 let _ = tokio::fs::remove_file(&temp_file_path).await;
                 return Err("Transfer cancelled".to_string());
             }
@@ -5556,7 +5529,6 @@ pub async fn cmd_upload_from_url(
     let peer = match resolve_peer(&client, folder_id, &state.peer_cache).await {
         Ok(p) => p,
         Err(e) => {
-            bw_state.release_up(actual_size);
             let _ = tokio::fs::remove_file(&temp_file_path).await;
             return Err(e);
         }
@@ -5605,6 +5577,7 @@ pub async fn cmd_upload_from_url(
     let _ = tokio::fs::remove_file(&temp_file_path).await;
 
     if send_success {
+        bandwidth_reservation.commit();
         let _ = app_handle.emit(
             "remote-upload-progress",
             RemoteProgressPayload {
@@ -5618,7 +5591,6 @@ pub async fn cmd_upload_from_url(
         );
         Ok("File uploaded successfully".to_string())
     } else {
-        bw_state.release_up(actual_size);
         Err(format!(
             "Upload failed after {} attempts: {}",
             max_retries + 1,

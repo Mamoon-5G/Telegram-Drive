@@ -1,4 +1,4 @@
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -8,39 +8,41 @@ use tauri::Manager;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BandwidthStats {
-    /// Monday that starts the current quota window. Kept as `date` for
-    /// backwards compatibility with existing bandwidth.json files.
+    /// Date of the current daily quota window (YYYY-MM-DD). Kept as `date`
+    /// for backwards compatibility with existing bandwidth.json files.
     pub date: String,
     pub up_bytes: u64,
     pub down_bytes: u64,
-    #[serde(default = "weekly_limit_bytes")]
+    #[serde(default = "daily_limit_bytes")]
     pub limit_bytes: u64,
-    #[serde(default = "weekly_period_name")]
+    #[serde(default = "daily_period_name")]
     pub period: String,
 }
 
-const WEEKLY_LIMIT_BYTES: u64 = 250 * 1024 * 1024 * 1024;
+pub const DAILY_LIMIT_BYTES: u64 = 1000 * 1024 * 1024 * 1024;
 
-fn weekly_limit_bytes() -> u64 {
-    WEEKLY_LIMIT_BYTES
+fn daily_limit_bytes() -> u64 {
+    DAILY_LIMIT_BYTES
 }
-fn weekly_period_name() -> String {
-    "weekly".to_string()
+fn daily_period_name() -> String {
+    "daily".to_string()
 }
 
-fn week_start_for(date: NaiveDate) -> NaiveDate {
-    date - Duration::days(date.weekday().num_days_from_monday() as i64)
+fn canonical_today_date() -> (NaiveDate, String) {
+    let today = Local::now().date_naive();
+    let formatted = today.format("%Y-%m-%d").to_string();
+    (today, formatted)
 }
 
 impl Default for BandwidthStats {
     fn default() -> Self {
-        let week_start = week_start_for(Local::now().date_naive());
+        let (_, date_str) = canonical_today_date();
         Self {
-            date: week_start.format("%Y-%m-%d").to_string(),
+            date: date_str,
             up_bytes: 0,
             down_bytes: 0,
-            limit_bytes: WEEKLY_LIMIT_BYTES,
-            period: weekly_period_name(),
+            limit_bytes: DAILY_LIMIT_BYTES,
+            period: daily_period_name(),
         }
     }
 }
@@ -48,7 +50,7 @@ impl Default for BandwidthStats {
 pub struct BandwidthManager {
     pub file_path: PathBuf,
     pub stats: Mutex<BandwidthStats>,
-    pub limit: u64, // Weekly limit in bytes
+    pub limit: u64, // Daily upload limit in bytes
 }
 
 #[derive(Clone, Copy)]
@@ -124,41 +126,36 @@ impl BandwidthManager {
             BandwidthStats::default()
         };
 
-        Self {
+        let manager = Self {
             file_path,
             stats: Mutex::new(stats),
-            limit: WEEKLY_LIMIT_BYTES,
-        }
+            limit: DAILY_LIMIT_BYTES,
+        };
+        manager.check_and_reset();
+        manager
     }
 
     pub fn check_and_reset(&self) {
-        let today = Local::now().date_naive();
-        let week_start = week_start_for(today);
+        let (_, canonical_date) = canonical_today_date();
         let mut stats = self.stats.lock().unwrap();
         let previous = stats.clone();
-        let stored_date = NaiveDate::parse_from_str(&stats.date, "%Y-%m-%d").ok();
-        let belongs_to_current_week = stored_date
-            .map(|date| date >= week_start && date <= today)
-            .unwrap_or(false);
-        let canonical_date = week_start.format("%Y-%m-%d").to_string();
-        let metadata_changed = stats.date != canonical_date
-            || stats.limit_bytes != self.limit
-            || stats.period != "weekly";
+        let is_current_day = stats.date == canonical_date && stats.period == "daily";
+        let metadata_changed = stats.limit_bytes != self.limit || stats.period != "daily";
 
-        if !belongs_to_current_week {
+        if !is_current_day {
             println!(
-                "[Bandwidth] New week detected. Resetting stats. Old period: {}, New period: {}",
-                stats.date, week_start
+                "[Bandwidth] New day detected. Resetting stats. Old period: {}, New period: {}",
+                stats.date, canonical_date
             );
             stats.up_bytes = 0;
             stats.down_bytes = 0;
+            stats.date = canonical_date.clone();
         }
-        // Canonicalize legacy daily files without discarding usage recorded
-        // earlier in the same week, and keep API metadata authoritative.
         stats.date = canonical_date;
         stats.limit_bytes = self.limit;
-        stats.period = weekly_period_name();
-        if !belongs_to_current_week || metadata_changed {
+        stats.period = daily_period_name();
+
+        if !is_current_day || metadata_changed {
             if let Err(error) = self.save_locked(&stats) {
                 *stats = previous;
                 log::error!("Unable to persist the bandwidth period rollover: {error}");
@@ -171,12 +168,11 @@ impl BandwidthManager {
         let stats = self.stats.lock().unwrap();
         let total = stats
             .up_bytes
-            .checked_add(stats.down_bytes)
-            .and_then(|used| used.checked_add(bytes))
+            .checked_add(bytes)
             .ok_or_else(|| "Bandwidth accounting overflowed".to_string())?;
         if total > self.limit {
             return Err(format!(
-                "Weekly bandwidth limit ({}) exceeded! Used: {}",
+                "Daily upload bandwidth limit ({}) exceeded! Used: {}",
                 self.format_bytes(self.limit),
                 self.format_bytes(total)
             ));
@@ -184,28 +180,24 @@ impl BandwidthManager {
         Ok(())
     }
 
-    /// Atomically check the limit AND reserve bandwidth for an upload.
-    /// Call release_up() if the transfer fails to avoid permanently consuming quota.
+    /// Atomically check the daily upload limit AND reserve bandwidth for an upload.
+    /// Call release_up() or drop BandwidthReservation if the transfer fails to avoid consuming quota.
     pub fn try_reserve_up(&self, bytes: u64) -> Result<(), String> {
         self.check_and_reset();
         let mut stats = self.stats.lock().unwrap();
         let total = stats
             .up_bytes
-            .checked_add(stats.down_bytes)
-            .and_then(|used| used.checked_add(bytes))
+            .checked_add(bytes)
             .ok_or_else(|| "Bandwidth accounting overflowed".to_string())?;
         if total > self.limit {
             return Err(format!(
-                "Weekly bandwidth limit ({}) exceeded! Used: {}",
+                "Daily upload bandwidth limit ({}) exceeded! Used: {}",
                 self.format_bytes(self.limit),
                 self.format_bytes(total)
             ));
         }
         let previous = stats.clone();
-        stats.up_bytes = stats
-            .up_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| "Bandwidth accounting overflowed".to_string())?;
+        stats.up_bytes = total;
         if let Err(error) = self.save_locked(&stats) {
             *stats = previous;
             return Err(error);
@@ -213,23 +205,11 @@ impl BandwidthManager {
         Ok(())
     }
 
-    /// Atomically check the limit AND reserve bandwidth for a download.
-    /// Call release_down() if the transfer fails to avoid permanently consuming quota.
+    /// Record download bandwidth for informational purposes.
+    /// Downloads do NOT consume or block against the upload quota.
     pub fn try_reserve_down(&self, bytes: u64) -> Result<(), String> {
         self.check_and_reset();
         let mut stats = self.stats.lock().unwrap();
-        let total = stats
-            .up_bytes
-            .checked_add(stats.down_bytes)
-            .and_then(|used| used.checked_add(bytes))
-            .ok_or_else(|| "Bandwidth accounting overflowed".to_string())?;
-        if total > self.limit {
-            return Err(format!(
-                "Weekly bandwidth limit ({}) exceeded! Used: {}",
-                self.format_bytes(self.limit),
-                self.format_bytes(total)
-            ));
-        }
         let previous = stats.clone();
         stats.down_bytes = stats
             .down_bytes
@@ -253,7 +233,7 @@ impl BandwidthManager {
         }
     }
 
-    /// Release reserved download bandwidth after a failed transfer.
+    /// Release reserved download bandwidth after a cancelled/failed transfer.
     pub fn release_down(&self, bytes: u64) {
         let mut stats = self.stats.lock().unwrap();
         let previous = stats.clone();
@@ -395,49 +375,93 @@ mod tests {
     }
 
     fn test_manager(label: &str) -> std::sync::Arc<BandwidthManager> {
-        test_manager_with_limit(label, WEEKLY_LIMIT_BYTES)
+        test_manager_with_limit(label, DAILY_LIMIT_BYTES)
     }
 
     #[test]
-    fn week_starts_on_monday() {
-        assert_eq!(
-            week_start_for(NaiveDate::from_ymd_opt(2026, 8, 23).unwrap()),
-            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()
-        );
-        assert_eq!(
-            week_start_for(NaiveDate::from_ymd_opt(2026, 8, 24).unwrap()),
-            NaiveDate::from_ymd_opt(2026, 8, 24).unwrap()
-        );
-    }
-
-    #[test]
-    fn legacy_daily_stats_receive_weekly_defaults() {
-        let stats: BandwidthStats =
-            serde_json::from_str(r#"{"date":"2026-08-20","up_bytes":10,"down_bytes":20}"#).unwrap();
-        assert_eq!(stats.limit_bytes, WEEKLY_LIMIT_BYTES);
-        assert_eq!(stats.period, "weekly");
-        assert_eq!(stats.up_bytes + stats.down_bytes, 30);
-    }
-
-    #[test]
-    fn failed_download_reservations_release_quota_on_drop() {
-        let manager = test_manager("release");
+    fn daily_reset_resets_on_new_date() {
+        let manager = test_manager("daily_reset");
         {
-            let _reservation = BandwidthReservation::download(manager.clone(), 4096).unwrap();
-            assert_eq!(manager.get_stats().down_bytes, 4096);
+            let mut stats = manager.stats.lock().unwrap();
+            stats.date = "2026-01-01".to_string();
+            stats.up_bytes = 50_000;
+            stats.down_bytes = 20_000;
         }
-        assert_eq!(manager.get_stats().down_bytes, 0);
+        manager.check_and_reset();
+        let stats = manager.get_stats();
+        let (_, today_str) = canonical_today_date();
+        assert_eq!(stats.date, today_str);
+        assert_eq!(stats.up_bytes, 0);
+        assert_eq!(stats.down_bytes, 0);
+        assert_eq!(stats.limit_bytes, DAILY_LIMIT_BYTES);
+        assert_eq!(stats.period, "daily");
         let _ = std::fs::remove_file(&manager.file_path);
     }
 
     #[test]
-    fn committed_download_reservations_remain_accounted() {
-        let manager = test_manager("commit");
+    fn same_day_preserves_upload_usage() {
+        let manager = test_manager("same_day");
+        manager.add_up(1024 * 1024);
+        manager.check_and_reset();
+        let stats = manager.get_stats();
+        assert_eq!(stats.up_bytes, 1024 * 1024);
+        let _ = std::fs::remove_file(&manager.file_path);
+    }
+
+    #[test]
+    fn failed_upload_reservation_releases_quota_on_drop() {
+        let manager = test_manager("upload_release");
         {
-            let mut reservation = BandwidthReservation::download(manager.clone(), 4096).unwrap();
+            let _reservation = BandwidthReservation::upload(manager.clone(), 8192).unwrap();
+            assert_eq!(manager.get_stats().up_bytes, 8192);
+        }
+        assert_eq!(manager.get_stats().up_bytes, 0);
+        let _ = std::fs::remove_file(&manager.file_path);
+    }
+
+    #[test]
+    fn committed_upload_reservation_remains_accounted() {
+        let manager = test_manager("upload_commit");
+        {
+            let mut reservation = BandwidthReservation::upload(manager.clone(), 8192).unwrap();
             reservation.commit();
         }
-        assert_eq!(manager.get_stats().down_bytes, 4096);
+        assert_eq!(manager.get_stats().up_bytes, 8192);
+        let _ = std::fs::remove_file(&manager.file_path);
+    }
+
+    #[test]
+    fn downloads_do_not_consume_upload_quota() {
+        let manager = test_manager_with_limit("dl_quota", 10_000);
+        // Add 50,000 bytes download (far more than limit)
+        manager.add_down(50_000);
+        // Upload of 5,000 bytes within the 10,000 limit should succeed
+        assert!(manager.can_transfer(5_000).is_ok());
+        assert!(manager.try_reserve_up(5_000).is_ok());
+        // Upload exceeding remaining 5,000 should fail
+        assert!(manager.try_reserve_up(6_000).is_err());
+        let _ = std::fs::remove_file(&manager.file_path);
+    }
+
+    #[test]
+    fn retry_does_not_double_count() {
+        let manager = test_manager("retry_count");
+        let file_size = 50_000_000u64;
+
+        // Attempt 1: Upload fails / drops without commit
+        {
+            let _attempt1 = BandwidthReservation::upload(manager.clone(), file_size).unwrap();
+            assert_eq!(manager.get_stats().up_bytes, file_size);
+            // simulated failure here (scope exits)
+        }
+        assert_eq!(manager.get_stats().up_bytes, 0);
+
+        // Attempt 2 (Retry): Upload succeeds and commits
+        {
+            let mut attempt2 = BandwidthReservation::upload(manager.clone(), file_size).unwrap();
+            attempt2.commit();
+        }
+        assert_eq!(manager.get_stats().up_bytes, file_size);
         let _ = std::fs::remove_file(&manager.file_path);
     }
 
@@ -461,6 +485,26 @@ mod tests {
         let persisted: BandwidthStats =
             serde_json::from_slice(&std::fs::read(&manager.file_path).unwrap()).unwrap();
         assert_eq!(persisted.up_bytes, 1_000);
+        let _ = std::fs::remove_file(&manager.file_path);
+    }
+
+    #[test]
+    fn daily_migration_from_old_weekly_bandwidth_json_is_safe() {
+        let manager = test_manager("migration");
+        // Simulate reading an old weekly json
+        let old_json = r#"{"date":"2026-08-24","up_bytes":150000,"down_bytes":250000,"limit_bytes":268435456000,"period":"weekly"}"#;
+        std::fs::write(&manager.file_path, old_json).unwrap();
+        let parsed: BandwidthStats = serde_json::from_str(old_json).unwrap();
+        *manager.stats.lock().unwrap() = parsed;
+
+        manager.check_and_reset();
+        let stats = manager.get_stats();
+        let (_, today_str) = canonical_today_date();
+        assert_eq!(stats.date, today_str);
+        assert_eq!(stats.period, "daily");
+        assert_eq!(stats.limit_bytes, DAILY_LIMIT_BYTES);
+        assert_eq!(stats.up_bytes, 0);
+        assert_eq!(stats.down_bytes, 0);
         let _ = std::fs::remove_file(&manager.file_path);
     }
 }
