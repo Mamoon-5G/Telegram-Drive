@@ -1627,9 +1627,8 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
       {/* Floating Bottom Nav Bar */}
       <BottomNavBar activeTab={activeTab} setActiveTab={setActiveTab} isAndroid={isAndroid} isTelevision={isTelevision} />
 
-      {/* Adsterra Banner (Android only) — z-[60] keeps it above the BottomNavBar (z-50).
-           Positioned at bottom-[144px] to sit cleanly above the nav bar (~60px tall, at bottom-20=80px). */}
-      <div className={`fixed bottom-[144px] left-0 right-0 z-[60] ${isTelevision ? 'tv-sponsor-placement' : ''}`}>
+      {/* Adsterra Banner (Android only) — z-[60] keeps it above the BottomNavBar (z-50). */}
+      <div className={`fixed bottom-[calc(4.5rem+env(safe-area-inset-bottom,0px))] left-0 right-0 z-[60] ${isTelevision ? 'tv-sponsor-placement' : ''}`}>
         <AdsterraBanner
           visible={adVisible}
           onSupport={openMobileSupporter}
